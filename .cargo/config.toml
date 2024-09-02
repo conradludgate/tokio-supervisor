@@ -1,0 +1,6 @@
+# not working for me :(
+# [build]
+# rustflags = ["--cfg", "tokio_unstable"]
+
+[target.aarch64-apple-darwin]
+rustflags = ["--cfg", "tokio_unstable"]

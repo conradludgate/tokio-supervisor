@@ -1,0 +1,18 @@
+[package]
+name = "tokio-supervisor"
+version = "0.1.0"
+edition = "2021"
+
+[dependencies]
+arrayvec = "0.7.6"
+backtrace = "0.3.73"
+nix = "0.29.0"
+signal-hook = "0.3.17"
+tokio = { version = "1.40.0", features = ["rt", "sync"] }
+
+[dev-dependencies]
+axum = "0.7.5"
+tokio = { version = "1.40.0", features = ["full", "macros", "test-util"] }
+
+[profile.release]
+debug = true

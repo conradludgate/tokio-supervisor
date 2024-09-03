@@ -31,9 +31,9 @@ so that tokio only reclaims the worker state once the task unblocks itself.
 ```rust
 #[tokio::main(flavor = "multi_thread", worker_threads = 2)]
 async fn main() {
-    // Create a new supervisor state and attach it to the current runtime.
+    // Create a new supervisor and attach it to the current runtime.
     // Spawn the supervisor thread to sample all workers every 100ms.
-    State::new(&tokio::runtime::Handle::current()).spawn_supervisor(Duration::from_millis(100));
+    Supervisor::new(&tokio::runtime::Handle::current()).spawn(Duration::from_millis(100));
 
     // Run some workload in the runtime.
     let svc = axum::Router::new()

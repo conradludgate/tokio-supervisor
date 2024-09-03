@@ -1,5 +1,4 @@
 use std::{
-    cell::OnceCell,
     hint::spin_loop,
     sync::{Arc, OnceLock},
     time::Duration,
@@ -145,10 +144,6 @@ impl State {
 struct WorkerState {
     poll_count: u64,
     blocked: bool,
-}
-
-thread_local! {
-    static WORKER_THREAD_IDX: OnceCell<usize>  = const { OnceCell::new()};
 }
 
 #[cfg(test)]

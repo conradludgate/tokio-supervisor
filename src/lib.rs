@@ -1,11 +1,11 @@
 use std::{
     cell::OnceCell,
     hint::spin_loop,
-    sync::{atomic::AtomicUsize, mpsc, Arc, Mutex, OnceLock, Weak},
+    sync::{Arc, OnceLock},
     time::Duration,
 };
 
-use nix::libc::{pthread_kill, pthread_self, pthread_t, SIGINFO};
+use nix::libc::{pthread_kill, SIGINFO};
 use signal_hook::low_level::channel::Channel;
 use tokio::runtime::{Builder, Runtime, RuntimeMetrics};
 
@@ -62,106 +62,60 @@ fn fulfill_backtrace(channel: &BtChan) {
 }
 
 pub struct State {
-    workers: Mutex<Vec<WorkerState>>,
+    workers: Vec<WorkerState>,
     metrics: RuntimeMetrics,
 }
 
 impl State {
-    pub fn new(f: impl for<'a> FnOnce(&'a mut Builder)) -> (Arc<State>, Runtime) {
-        let worker_idx = Arc::new(AtomicUsize::new(0));
-        let (tx, rx) = mpsc::sync_channel(1);
+    pub fn new(f: impl for<'a> FnOnce(&'a mut Builder)) -> (State, Runtime) {
+        let mut builder = tokio::runtime::Builder::new_multi_thread();
+        f(&mut builder);
+        let rt = builder.build().unwrap();
 
-        let mut rt = None;
-        let state = Arc::<State>::new_cyclic(|state| {
-            let state = state.clone();
-            let state2 = state.clone();
+        let metrics = rt.metrics();
+        let workers: Vec<WorkerState> = std::iter::repeat(WorkerState {
+            poll_count: 0,
+            blocked: false,
+        })
+        .take(metrics.num_workers())
+        .collect();
 
-            let mut builder = tokio::runtime::Builder::new_multi_thread();
+        let state = State { workers, metrics };
 
-            f(&mut builder);
-
-            let rt1 = builder
-                .on_thread_start(move || {
-                    let id = worker_idx.fetch_add(1, std::sync::atomic::Ordering::Relaxed);
-                    WORKER_THREAD_IDX.with(|c| c.set(id).unwrap());
-                    let _ = tx.send(WorkerState {
-                        thread: unsafe { pthread_self() },
-                        parked: true,
-                        poll_count: 0,
-                        blocked: false,
-                    });
-                })
-                .on_thread_park(move || State::park(&state))
-                .on_thread_unpark(move || State::unpark(&state2))
-                .build()
-                .unwrap();
-
-            let metrics = rt1.metrics();
-            let workers: Vec<WorkerState> = std::iter::from_fn(|| rx.recv().ok())
-                .take(metrics.num_workers())
-                .collect();
-
-            rt = Some(rt1);
-
-            State {
-                workers: Mutex::new(workers),
-                metrics,
-            }
-        });
-
-        let rt = rt.unwrap();
         (state, rt)
     }
 
-    fn get_worker(state: &Weak<Self>, f: impl for<'a> FnOnce(&'a mut WorkerState)) {
-        let Some(id) = WORKER_THREAD_IDX.with(|c| c.get().copied()) else {
-            return;
-        };
-        let Some(state) = state.upgrade() else { return };
-        let mut workers = state.workers.lock().unwrap();
-        let Some(worker_state) = workers.get_mut(id) else {
-            return;
-        };
-        f(worker_state)
-    }
-
-    fn park(state: &Weak<Self>) {
-        Self::get_worker(state, |w| {
-            w.parked = true;
-            w.blocked = false;
-        });
-    }
-
-    fn unpark(state: &Weak<Self>) {
-        Self::get_worker(state, |w| {
-            w.parked = false;
-            w.blocked = false;
-        });
-    }
-
-    fn supervisor(&self, interval: Duration, channel: &BtChan) {
+    fn supervisor(&mut self, interval: Duration, channel: &BtChan) {
         loop {
             std::thread::sleep(interval);
-            let mut workers = self.workers.lock().unwrap().clone();
 
-            for (i, worker_state) in workers.iter_mut().enumerate() {
+            for (i, worker_state) in self.workers.iter_mut().enumerate() {
                 let new_count = self.metrics.worker_poll_count(i);
 
-                // thread is blocked.
-                if worker_state.parked {
+                // An odd count means that the worker is currently parked. An even count means that the worker is currently active.
+                let unpark_count = self.metrics.worker_park_unpark_count(i);
+
+                if unpark_count % 2 == 1 {
+                    // we are parked. mark as unblocked.
                     if worker_state.blocked {
                         println!("worker thread {i} is parked")
                     }
+                    worker_state.blocked = false;
                 } else if worker_state.poll_count == new_count {
+                    // no poll progress was made since last loop.
                     if !worker_state.blocked {
+                        // we were not blocked before. get the backtrace from the registered thread.
                         println!(
                             "worker thread {i} is blocked ({} == {new_count})",
                             worker_state.poll_count
                         );
-                        request_backtrace(worker_state.thread, channel);
+                        if let Some(thread) = self.metrics.worker_pthread_id(i) {
+                            request_backtrace(thread, channel);
+                        }
                     }
                     worker_state.blocked = true;
                 } else {
+                    // progress was made since last loop. mark as unblocked.
                     if worker_state.blocked {
                         println!(
                             "worker thread {i} is not blocked ({} < {new_count})",
@@ -173,16 +127,10 @@ impl State {
 
                 worker_state.poll_count = new_count;
             }
-
-            let mut workers2 = self.workers.lock().unwrap();
-            std::iter::zip(&mut *workers2, workers).for_each(|(w2, w)| {
-                w2.poll_count = w.poll_count;
-                w2.blocked = w.blocked;
-            });
         }
     }
 
-    pub fn spawn_supervisor(self: Arc<Self>, interval: Duration) {
+    pub fn spawn_supervisor(mut self, interval: Duration) {
         let channel = register_backtrace();
         std::thread::spawn(move || {
             self.supervisor(interval, &channel);
@@ -192,9 +140,7 @@ impl State {
 
 #[derive(Clone, Copy)]
 struct WorkerState {
-    thread: pthread_t,
     poll_count: u64,
-    parked: bool,
     blocked: bool,
 }
 
@@ -216,7 +162,7 @@ mod tests {
         let (state, rt) = State::new(|b| {
             b.worker_threads(2).enable_all();
         });
-        state.spawn_supervisor(Duration::from_millis(50));
+        state.spawn_supervisor(Duration::from_millis(100));
 
         rt.block_on(async move {
             let svc = axum::Router::new()

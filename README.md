@@ -29,16 +29,13 @@ so that tokio only reclaims the worker state once the task unblocks itself.
 ## Example
 
 ```rust
-// Create the runtime with our supervisor state attached
-let (state, rt) = State::new(|b| {
-    b.worker_threads(2).enable_all();
-});
+#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
+async fn main() {
+    // Create a new supervisor state and attach it to the current runtime.
+    // Spawn the supervisor thread to sample all workers every 100ms.
+    State::new(&tokio::runtime::Handle::current()).spawn_supervisor(Duration::from_millis(100));
 
-/// Spawn the supervisor thread to sample all workers every 50ms.
-state.spawn_supervisor(Duration::from_millis(50));
-
-/// Run some workload in the runtime.
-rt.block_on(async move {
+    // Run some workload in the runtime.
     let svc = axum::Router::new()
         .route("/fast", get(|| async {}))
         // will block the runtime when this API is hit.
@@ -51,7 +48,7 @@ rt.block_on(async move {
     axum::serve(TcpListener::bind("0.0.0.0:8123").await.unwrap(), svc)
         .await
         .unwrap()
-});
+}
 ```
 
 Calling `http://localhost:8123/fast` shows nothing. Calling `http://localhost:8123/slow` prints

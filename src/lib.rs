@@ -5,9 +5,9 @@ use std::{
     time::Duration,
 };
 
-use nix::libc::{pthread_kill, SIGINFO};
+use libc::{pthread_kill, SIGPROF};
 use signal_hook::low_level::channel::Channel;
-use tokio::runtime::{Builder, Runtime, RuntimeMetrics};
+use tokio::runtime::RuntimeMetrics;
 
 const FRAMES: usize = 8;
 
@@ -21,7 +21,7 @@ fn register_backtrace() -> Arc<BtChan> {
             let channel2 = channel.clone();
 
             unsafe {
-                signal_hook::low_level::register(SIGINFO, move || fulfill_backtrace(&channel2))
+                signal_hook::low_level::register(SIGPROF, move || fulfill_backtrace(&channel2))
                     .unwrap()
             };
 
@@ -31,7 +31,7 @@ fn register_backtrace() -> Arc<BtChan> {
 }
 
 fn request_backtrace(thread: usize, channel: &BtChan) {
-    unsafe { pthread_kill(thread, SIGINFO) };
+    unsafe { pthread_kill(thread, SIGPROF) };
 
     loop {
         let Some(frames) = channel.recv() else {
@@ -67,12 +67,17 @@ pub struct State {
 }
 
 impl State {
-    pub fn new(f: impl for<'a> FnOnce(&'a mut Builder)) -> (State, Runtime) {
-        let mut builder = tokio::runtime::Builder::new_multi_thread();
-        f(&mut builder);
-        let rt = builder.build().unwrap();
+    pub fn new(rt_handle: &tokio::runtime::Handle) -> Self {
+        match rt_handle.runtime_flavor() {
+            tokio::runtime::RuntimeFlavor::MultiThread => {}
+            tokio::runtime::RuntimeFlavor::MultiThreadAlt => {}
+            tokio::runtime::RuntimeFlavor::CurrentThread => {
+                panic!("does not work with current thread runtimes. only works with multithreaded runtimes")
+            }
+            _ => panic!("unknown runtime flavor. only works with multithreaded runtimes"),
+        }
 
-        let metrics = rt.metrics();
+        let metrics = rt_handle.metrics();
         let workers: Vec<WorkerState> = std::iter::repeat(WorkerState {
             poll_count: 0,
             blocked: false,
@@ -80,9 +85,7 @@ impl State {
         .take(metrics.num_workers())
         .collect();
 
-        let state = State { workers, metrics };
-
-        (state, rt)
+        State { workers, metrics }
     }
 
     fn supervisor(&mut self, interval: Duration, channel: &BtChan) {
@@ -157,25 +160,20 @@ mod tests {
 
     use crate::State;
 
-    #[test]
-    fn it_works() {
-        let (state, rt) = State::new(|b| {
-            b.worker_threads(2).enable_all();
-        });
-        state.spawn_supervisor(Duration::from_millis(100));
+    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
+    async fn it_works() {
+        State::new(&tokio::runtime::Handle::current()).spawn_supervisor(Duration::from_millis(100));
 
-        rt.block_on(async move {
-            let svc = axum::Router::new()
-                .route("/fast", get(|| async {}))
-                .route(
-                    "/slow",
-                    get(|| async { std::thread::sleep(Duration::from_secs(5)) }),
-                )
-                .with_state(())
-                .into_make_service();
-            axum::serve(TcpListener::bind("0.0.0.0:8123").await.unwrap(), svc)
-                .await
-                .unwrap()
-        });
+        let svc = axum::Router::new()
+            .route("/fast", get(|| async {}))
+            .route(
+                "/slow",
+                get(|| async { std::thread::sleep(Duration::from_secs(5)) }),
+            )
+            .with_state(())
+            .into_make_service();
+        axum::serve(TcpListener::bind("0.0.0.0:8123").await.unwrap(), svc)
+            .await
+            .unwrap()
     }
 }

@@ -2,11 +2,13 @@ use core::fmt;
 use std::{
     hint::spin_loop,
     path::PathBuf,
-    sync::{Arc, OnceLock},
+    sync::{Arc, OnceLock, RwLock},
+    thread::ThreadId,
     time::Duration,
 };
 
 use backtrace::{BacktraceFmt, BytesOrWideString, PrintFmt, SymbolName};
+use foldhash::HashMap;
 use libc::{pthread_kill, SIGPROF};
 use signal_hook::low_level::channel::Channel;
 use tokio::runtime::RuntimeMetrics;
@@ -151,17 +153,51 @@ pub struct Supervisor {
     metrics: RuntimeMetrics,
 }
 
+static THREADS: ThreadMapping = ThreadMapping {
+    threads: RwLock::new(None),
+};
+
+struct ThreadMapping {
+    threads: RwLock<Option<HashMap<ThreadId, libc::pthread_t>>>,
+}
+
+impl ThreadMapping {
+    fn get_pthread(&self, t: &ThreadId) -> Option<libc::pthread_t> {
+        self.threads
+            .read()
+            .unwrap()
+            .as_ref()
+            .and_then(|h| h.get(t).copied())
+    }
+}
+
+pub fn on_thread_start() {
+    let pthread = unsafe { libc::pthread_self() };
+    let thread = std::thread::current().id();
+
+    THREADS
+        .threads
+        .write()
+        .unwrap()
+        .get_or_insert_with(HashMap::default)
+        .entry(thread)
+        .and_modify(|p| *p = pthread)
+        .or_insert(pthread);
+}
+
+pub fn on_thread_stop() {
+    let thread = std::thread::current().id();
+
+    THREADS
+        .threads
+        .write()
+        .unwrap()
+        .as_mut()
+        .map(|h| h.remove(&thread));
+}
+
 impl Supervisor {
     pub fn new(rt_handle: &tokio::runtime::Handle) -> Self {
-        match rt_handle.runtime_flavor() {
-            tokio::runtime::RuntimeFlavor::MultiThread => {}
-            tokio::runtime::RuntimeFlavor::MultiThreadAlt => {}
-            tokio::runtime::RuntimeFlavor::CurrentThread => {
-                panic!("does not work with current thread runtimes. only works with multithreaded runtimes")
-            }
-            _ => panic!("unknown runtime flavor. only works with multithreaded runtimes"),
-        }
-
         let metrics = rt_handle.metrics();
         let workers: Vec<WorkerState> = std::iter::repeat(WorkerState {
             poll_count: 0,
@@ -187,11 +223,12 @@ impl Supervisor {
                 // no poll progress was made since last loop.
                 if !worker_state.blocked {
                     // we were not blocked before. get the backtrace from the registered thread.
-                    println!(
-                        "worker thread {i} is blocked ({} == {new_count})",
-                        worker_state.poll_count
-                    );
-                    if let Some(thread) = self.metrics.worker_pthread_id(i) {
+                    println!("worker thread {i} is blocked");
+                    if let Some(thread) = self
+                        .metrics
+                        .worker_thread_id(i)
+                        .and_then(|t| THREADS.get_pthread(&t))
+                    {
                         request_backtrace(thread, channel);
                     }
                 }
@@ -235,9 +272,17 @@ mod tests {
 
     use crate::Supervisor;
 
-    #[tokio::test(flavor = "multi_thread", worker_threads = 2)]
-    async fn it_works() {
-        Supervisor::new(&tokio::runtime::Handle::current()).spawn(Duration::from_millis(100));
+    #[test]
+    fn it_works() {
+        let rt = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(2)
+            .enable_all()
+            .on_thread_start(crate::on_thread_start)
+            .on_thread_stop(crate::on_thread_stop)
+            .build()
+            .unwrap();
+
+        Supervisor::new(rt.handle()).spawn(Duration::from_millis(100));
 
         let svc = axum::Router::new()
             .route("/fast", get(|| async {}))
@@ -251,8 +296,11 @@ mod tests {
             )
             .with_state(())
             .into_make_service();
-        axum::serve(TcpListener::bind("0.0.0.0:8123").await.unwrap(), svc)
-            .await
-            .unwrap()
+
+        rt.block_on(async {
+            axum::serve(TcpListener::bind("0.0.0.0:8123").await.unwrap(), svc)
+                .await
+                .unwrap()
+        })
     }
 }

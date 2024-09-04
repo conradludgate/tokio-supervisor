@@ -4,14 +4,26 @@ use std::time::Duration;
 
 use tokio_supervisor::Supervisor;
 
+#[test]
+fn test() {
+    let rt = tokio::runtime::Builder::new_multi_thread()
+        .worker_threads(2)
+        .enable_all()
+        .on_thread_start(tokio_supervisor::on_thread_start)
+        .on_thread_stop(tokio_supervisor::on_thread_stop)
+        .build()
+        .unwrap();
+
+    Supervisor::new(rt.handle()).spawn(Duration::from_millis(100));
+
+    rt.block_on(turso_main());
+}
+
 async fn sleepy_task() {
     tokio::time::sleep(Duration::from_millis(100)).await;
 }
 
-#[tokio::test(flavor = "multi_thread", worker_threads = 1)]
-async fn test() {
-    Supervisor::new(&tokio::runtime::Handle::current()).spawn(Duration::from_millis(100));
-
+async fn turso_main() {
     let mutex = std::sync::Arc::new(std::sync::Mutex::new(()));
     let async_task = tokio::spawn({
         let mutex = mutex.clone();
@@ -25,6 +37,7 @@ async fn test() {
             }
         }
     });
+
     let blocking_task = tokio::task::spawn_blocking({
         let mutex = mutex.clone();
         move || loop {

@@ -144,6 +144,12 @@ source = "registry+https://github.com/rust-lang/crates.io-index"
 checksum = "3f9eec918d3f24069decb9af1554cad7c880e2da24a9afd88aca000531ab82c1"
 
 [[package]]
+name = "foldhash"
+version = "0.1.1"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "67442eab18f81a350b79a83a322bd47cfdec87de4e070c6463c3922983c5031d"
+
+[[package]]
 name = "form_urlencoded"
 version = "1.2.1"
 source = "registry+https://github.com/rust-lang/crates.io-index"
@@ -592,7 +598,8 @@ checksum = "a7065abeca94b6a8a577f9bd45aa0867a2238b74e8eb67cf10d492bc39351394"
 [[package]]
 name = "tokio"
 version = "1.40.0"
-source = "git+https://github.com/conradludgate/tokio?branch=tokio-supervisor#9d96218b41585e327c00fc85b4b6b1ac5288e678"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "e2b070231665d27ad9ec9b8df639893f46727666c6767db40317fbe920a5d998"
 dependencies = [
  "backtrace",
  "bytes",
@@ -609,7 +616,8 @@ dependencies = [
 [[package]]
 name = "tokio-macros"
 version = "2.4.0"
-source = "git+https://github.com/conradludgate/tokio?branch=tokio-supervisor#9d96218b41585e327c00fc85b4b6b1ac5288e678"
+source = "registry+https://github.com/rust-lang/crates.io-index"
+checksum = "693d596312e88961bc67d7f1f97af8a70227d9f90c31bba5806eec004978d752"
 dependencies = [
  "proc-macro2",
  "quote",
@@ -623,6 +631,7 @@ dependencies = [
  "arrayvec",
  "axum",
  "backtrace",
+ "foldhash",
  "libc",
  "signal-hook",
  "tokio",

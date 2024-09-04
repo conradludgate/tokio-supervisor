@@ -14,7 +14,7 @@ fn test() {
         .build()
         .unwrap();
 
-    Supervisor::new(rt.handle()).spawn(Duration::from_millis(100));
+    Supervisor::new(rt.handle().clone()).spawn(Duration::from_millis(100));
 
     rt.block_on(turso_main());
 }

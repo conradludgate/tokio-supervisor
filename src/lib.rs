@@ -2,7 +2,7 @@ use core::fmt;
 use std::{
     hint::spin_loop,
     path::PathBuf,
-    sync::{Arc, OnceLock, RwLock},
+    sync::{OnceLock, RwLock},
     thread::ThreadId,
     time::Duration,
 };
@@ -16,7 +16,7 @@ use tokio::runtime::RuntimeMetrics;
 const FRAMES: usize = 16;
 
 type BtChan = Channel<arrayvec::ArrayVec<backtrace::Frame, FRAMES>>;
-static BACKTRACE_HOOK: OnceLock<Arc<BtChan>> = OnceLock::new();
+static BACKTRACE_HOOK: OnceLock<BtChan> = OnceLock::new();
 
 pub struct Backtrace {
     // Frames here are listed from top-to-bottom of the stack
@@ -89,20 +89,20 @@ impl fmt::Debug for Backtrace {
     }
 }
 
-fn register_backtrace() -> Arc<BtChan> {
-    BACKTRACE_HOOK
-        .get_or_init(|| {
-            let channel = Arc::new(Channel::new());
-            let channel2 = channel.clone();
+fn register_backtrace() -> &'static BtChan {
+    let mut init = false;
+    let channel = BACKTRACE_HOOK.get_or_init(|| {
+        init = true;
+        Channel::new()
+    });
 
-            unsafe {
-                signal_hook::low_level::register(SIGPROF, move || fulfill_backtrace(&channel2))
-                    .unwrap()
-            };
+    if init {
+        unsafe {
+            signal_hook::low_level::register(SIGPROF, move || fulfill_backtrace(channel)).unwrap()
+        };
+    }
 
-            channel
-        })
-        .clone()
+    channel
 }
 
 fn request_backtrace(thread: usize, channel: &BtChan) {
@@ -150,6 +150,7 @@ fn fulfill_backtrace(channel: &BtChan) {
 
 pub struct Supervisor {
     workers: Vec<WorkerState>,
+    handle: tokio::runtime::Handle,
     metrics: RuntimeMetrics,
 }
 
@@ -197,19 +198,23 @@ pub fn on_thread_stop() {
 }
 
 impl Supervisor {
-    pub fn new(rt_handle: &tokio::runtime::Handle) -> Self {
-        let metrics = rt_handle.metrics();
+    pub fn new(handle: tokio::runtime::Handle) -> Self {
+        let metrics = handle.metrics();
         let workers: Vec<WorkerState> = std::iter::repeat(WorkerState {
             poll_count: 0,
-            blocked: false,
+            blocked: true,
         })
         .take(metrics.num_workers())
         .collect();
 
-        Supervisor { workers, metrics }
+        Supervisor {
+            workers,
+            handle,
+            metrics,
+        }
     }
 
-    fn sample(&mut self, channel: &BtChan) {
+    async fn sample(&mut self, channel: &'static BtChan) {
         for (i, worker_state) in self.workers.iter_mut().enumerate() {
             let new_count = self.metrics.worker_poll_count(i);
 
@@ -229,7 +234,9 @@ impl Supervisor {
                         .worker_thread_id(i)
                         .and_then(|t| THREADS.get_pthread(&t))
                     {
-                        request_backtrace(thread, channel);
+                        tokio::task::spawn_blocking(move || request_backtrace(thread, channel))
+                            .await
+                            .unwrap();
                     }
                 }
                 worker_state.blocked = true;
@@ -242,17 +249,19 @@ impl Supervisor {
         }
     }
 
-    fn run(&mut self, interval: Duration, channel: &BtChan) {
+    async fn run(&mut self, interval: Duration, channel: &'static BtChan) {
+        let mut interval = tokio::time::interval(interval);
         loop {
-            std::thread::sleep(interval);
-            self.sample(channel);
+            interval.tick().await;
+            self.sample(channel).await;
         }
     }
 
     pub fn spawn(mut self, interval: Duration) {
         let channel = register_backtrace();
-        std::thread::spawn(move || {
-            self.run(interval, &channel);
+        let rt = self.handle.clone();
+        rt.spawn(async move {
+            self.run(interval, channel).await;
         });
     }
 }
@@ -282,7 +291,7 @@ mod tests {
             .build()
             .unwrap();
 
-        Supervisor::new(rt.handle()).spawn(Duration::from_millis(100));
+        Supervisor::new(rt.handle().clone()).spawn(Duration::from_millis(100));
 
         let svc = axum::Router::new()
             .route("/fast", get(|| async {}))

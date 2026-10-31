@@ -5,10 +5,42 @@ Work in progress
 ## What is this?
 
 This is a library that hooks into your tokio runtime (using unstable features) to monitor your runtime
-threads for suspicious tasks that are blocking the thread. It currently only works on Linux and MacOS.
+threads for suspicious tasks that are blocking the thread. The implementation
+uses POSIX signals and pthreads; Windows support is not implemented.
 
 In the future, it will also attempt to spawn some new worker threads to pick up the slack to try
 and improve efficiency and unblock your application in the rare event that all your tasks end up blocking.
+
+## Build requirements
+
+The worker metrics require Tokio's unstable APIs. This repository enables
+`--cfg tokio_unstable` in `.cargo/config.toml`. Applications using this crate as a
+dependency must enable the same cfg for their build, including Tokio itself:
+
+```sh
+RUSTFLAGS="--cfg tokio_unstable" cargo check
+```
+
+Cargo does not apply a dependency's `.cargo/config.toml` to its consumer. If
+your application already sets `RUSTFLAGS`, append the cfg to those flags.
+
+The checked build baseline is Linux x86_64, Rust 1.99.1, and the repository's
+Cargo.lock (Tokio 1.40.0). Tokio's unstable interfaces can change when updating
+dependencies. Other platform builds and capture backends are not validated by
+these checks.
+
+From this repository, use `cargo check --locked --lib` for the normal dependency
+configuration and `cargo test --locked --no-run` to compile the manual harnesses.
+The existing tests serve HTTP or intentionally run indefinitely; `--no-run`
+checks compilation and is not a successful runtime test.
+
+## Current limitations
+
+This is an experimental capture path. Its native unwinder's async-signal safety
+is not established by a successful build. Capture requests can wait indefinitely
+for a response, and responses are not correlated with individual requests.
+The sampler runs on the monitored runtime, so it cannot make progress while all
+of that runtime's workers are blocked. These require separate design work.
 
 ## How does it work?
 
@@ -33,7 +65,7 @@ so that tokio only reclaims the worker state once the task unblocks itself.
 async fn main() {
     // Create a new supervisor and attach it to the current runtime.
     // Spawn the supervisor thread to sample all workers every 100ms.
-    Supervisor::new(&tokio::runtime::Handle::current()).spawn(Duration::from_millis(100));
+    Supervisor::new(tokio::runtime::Handle::current()).spawn(Duration::from_millis(100));
 
     // Run some workload in the runtime.
     let svc = axum::Router::new()

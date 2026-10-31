@@ -105,7 +105,7 @@ fn register_backtrace() -> &'static BtChan {
     channel
 }
 
-fn request_backtrace(thread: usize, channel: &BtChan) {
+fn request_backtrace(thread: libc::pthread_t, channel: &BtChan) {
     unsafe { pthread_kill(thread, SIGPROF) };
 
     loop {

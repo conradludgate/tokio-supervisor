@@ -74,6 +74,12 @@ The Linux [external GDB capture experiment](docs/external-capture.md) collects a
 one-shot process snapshot after a stall event. It pauses the whole application
 and is an opt-in example, with an external deadline and bounded collector output.
 
+The Linux x86_64 [single-thread snapshot experiment](docs/thread-capture.md)
+reuses an external collector, stops only the selected thread, and resumes it
+before unwinding a bounded copy of its stack. It records separate stop, request
+and collector-startup timings. It remains an opt-in example with controlled
+target lifetime and ptrace ownership.
+
 ## Build requirements
 
 Worker metrics require Tokio's unstable APIs. This repository enables

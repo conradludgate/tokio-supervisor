@@ -28,16 +28,19 @@ jobs:
     steps:
       - uses: actions/checkout@v4
       - uses: dtolnay/rust-toolchain@stable
-      - run: sudo apt-get update && sudo apt-get install -y gdb
+      - run: sudo apt-get update && sudo apt-get install -y gdb binutils
       - run: mkdir -p .scratch/capture-tmp
-      - run: cargo build --example capture_gdb --locked
+      - run: cargo build --example capture_gdb --example capture_thread --locked
         env:
           TMPDIR: ${{ github.workspace }}/.scratch/capture-tmp
       - run: python3 scripts/test-external-capture.py target/debug/examples/capture_gdb "$(command -v gdb)" .scratch/capture-checks
+      - run: python3 scripts/test-thread-capture.py target/debug/examples/capture_thread .scratch/thread-checks
       - uses: actions/upload-artifact@v4
         if: failure()
         with:
           name: external-capture-reports
-          path: .scratch/capture-checks
+          path: |
+            .scratch/capture-checks
+            .scratch/thread-checks
           include-hidden-files: true
           retention-days: 7

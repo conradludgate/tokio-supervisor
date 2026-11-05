@@ -40,8 +40,25 @@ struct Frame {
     return_address: bool,
 }
 
+#[derive(Clone, Copy, Debug, PartialEq, Eq, Serialize, Deserialize)]
+struct Target {
+    runtime: usize,
+    worker: usize,
+    tid: i32,
+    start_time: u64,
+}
+
+#[derive(Serialize, Deserialize)]
+#[serde(tag = "status", rename_all = "snake_case")]
+enum Response {
+    Captured(Sample),
+    TargetUnavailable { target: Target },
+}
+
 #[derive(Serialize, Deserialize)]
 struct Sample {
+    target: Target,
+    collector_pid: u32,
     /// Conservative stop bound: immediately before INTERRUPT to after DETACH.
     interrupt_to_detach_ns: u64,
     request_ns: u64,
@@ -64,7 +81,7 @@ struct Image {
 struct Report {
     version: u32,
     architecture: &'static str,
-    tid: i32,
+    rejected: Vec<Target>,
     collector_ready_ns: u64,
     images: Vec<Image>,
     samples: Vec<Sample>,
@@ -73,13 +90,13 @@ struct Report {
 pub fn run() -> Result<()> {
     let args: Vec<_> = std::env::args().skip(1).collect();
     if args.first().is_some_and(|s| s == "--collector") {
-        if args.len() != 4 {
+        if args.len() != 3 {
             return Err("invalid collector arguments".into());
         }
-        return collector(args[1].parse()?, args[2].parse()?, &args[3]);
+        return collector(args[1].parse()?, &args[2]);
     }
     let report = args.first().ok_or(
-        "usage: capture_thread REPORT [normal|blocked|hold|timeout|read-error|short-stack|no-permission]",
+        "usage: capture_thread REPORT [normal|blocked|hold|timeout|read-error|short-stack|no-permission|multi|multi-hold]",
     )?;
     let mode = args.get(1).map(String::as_str).unwrap_or("normal");
     if args.len() > 2
@@ -91,6 +108,8 @@ pub fn run() -> Result<()> {
             "read-error",
             "short-stack",
             "no-permission",
+            "multi",
+            "multi-hold",
         ]
         .contains(&mode)
     {
@@ -101,23 +120,30 @@ pub fn run() -> Result<()> {
         .create_new(true)
         .mode(0o600)
         .open(report)?;
+    if mode == "multi" || mode == "multi-hold" {
+        return multi_runtime(output, mode == "multi-hold");
+    }
     let heartbeat = Heartbeat::new();
-    let mut worker = Worker::new(mode == "blocked")?;
+    let mut worker = Worker::new(0, mode == "blocked")?;
     let result = (|| -> Result<()> {
-        let mut client = Client::start(worker.tid, mode)?;
+        let mut client = Client::start(mode)?;
         let mut samples = Vec::new();
         for _ in 0..if mode == "hold" { 1 } else { 20 } {
-            samples.push(client.capture(|| check_held(&worker, &heartbeat.progress))?);
-            assert_untraced(worker.tid)?;
+            samples.push(
+                client
+                    .capture(worker.target, || check_held(&worker, &heartbeat.progress))?
+                    .ok_or("worker exited before capture")?,
+            );
+            assert_untraced(worker.target.tid)?;
         }
         client.finish()?;
         println!("completed {} captures with one collector", samples.len());
         serde_json::to_writer(
             output,
             &Report {
-                version: 1,
+                version: 2,
                 architecture: "x86_64",
-                tid: worker.tid,
+                rejected: Vec::new(),
                 collector_ready_ns: client.ready_ns,
                 images: std::mem::take(&mut client.images),
                 samples,
@@ -130,6 +156,123 @@ pub fn run() -> Result<()> {
     result
 }
 
+fn capture_worker(
+    client: &mut Client,
+    worker: &Worker,
+    heartbeat: &AtomicU64,
+    other: &Worker,
+) -> Result<Sample> {
+    let sample = client
+        .capture(worker.target, || {
+            let before = other.progress.load(Ordering::Relaxed);
+            check_held(worker, heartbeat)?;
+            assert!(other.progress.load(Ordering::Relaxed) > before);
+            Ok(())
+        })?
+        .ok_or("live worker was rejected")?;
+    assert_untraced(worker.target.tid)?;
+    Ok(sample)
+}
+
+fn multi_runtime(output: File, hold: bool) -> Result<()> {
+    let heartbeat = Heartbeat::new();
+    let mut a = Some(Worker::new(0, false)?);
+    let stale = a.as_ref().unwrap().target;
+    let mut client = Client::start(if hold { "hold" } else { "normal" })?;
+    // Deliberately create the other runtimes after the helper loaded modules.
+    let mut b = Worker::new(1, false)?;
+    let mut c = None;
+    let mut samples = Vec::new();
+    let mut rejected = Vec::new();
+    let rounds = if hold { 1 } else { 20 };
+    let result = (|| -> Result<()> {
+        for round in 0..rounds {
+            samples.push(capture_worker(
+                &mut client,
+                a.as_ref().unwrap(),
+                &heartbeat.progress,
+                &b,
+            )?);
+            samples.push(
+                client
+                    .capture(b.target, || {
+                        let before = a.as_ref().unwrap().progress.load(Ordering::Relaxed);
+                        check_held(&b, &heartbeat.progress)?;
+                        assert!(a.as_ref().unwrap().progress.load(Ordering::Relaxed) > before);
+                        if round + 1 == rounds {
+                            let mut old = a.take().unwrap();
+                            old.stop()?;
+                            drop(old);
+                            println!("runtime A shut down while runtime B remained held");
+                        }
+                        Ok(())
+                    })?
+                    .ok_or("live worker B was rejected")?,
+            );
+            assert_untraced(b.target.tid)?;
+        }
+        if let Some(mut old) = a.take() {
+            old.stop()?;
+        }
+        assert!(client
+            .capture(stale, || Err("exited target was stopped".into()))?
+            .is_none());
+        rejected.push(stale);
+        let wrong_identity = Target {
+            start_time: b.target.start_time.wrapping_add(1),
+            ..b.target
+        };
+        assert!(client
+            .capture(wrong_identity, || Err("wrong identity was stopped".into()))?
+            .is_none());
+        rejected.push(wrong_identity);
+        println!("exited and mismatched targets rejected without restarting collector");
+        c = Some(Worker::new(2, false)?);
+        for _ in 0..rounds {
+            samples.push(capture_worker(
+                &mut client,
+                c.as_ref().unwrap(),
+                &heartbeat.progress,
+                &b,
+            )?);
+            samples.push(capture_worker(
+                &mut client,
+                &b,
+                &heartbeat.progress,
+                c.as_ref().unwrap(),
+            )?);
+        }
+        Ok(())
+    })();
+    let finished = client.finish();
+    if let Some(mut old) = a.take() {
+        old.stop()?;
+    }
+    b.stop()?;
+    if let Some(mut last) = c.take() {
+        last.stop()?;
+    }
+    println!("target resumed; blocked worker completed");
+    result?;
+    finished?;
+    println!(
+        "completed {} captures across three runtimes with one collector",
+        samples.len()
+    );
+    serde_json::to_writer(
+        output,
+        &Report {
+            version: 2,
+            architecture: "x86_64",
+            rejected,
+            collector_ready_ns: client.ready_ns,
+            images: std::mem::take(&mut client.images),
+            samples,
+        },
+    )?;
+    Ok(())
+}
+
 // The demo owns these tasks until capture completes. Runtime shutdown releases
 // their flag/channel and joins them before dropping their runtime.
 struct Worker {
@@ -139,11 +282,11 @@ struct Worker {
     running: Stop,
     release: Option<mpsc::Sender<()>>,
     progress: Arc<AtomicU64>,
-    tid: i32,
+    target: Target,
 }
 
 impl Worker {
-    fn new(blocked: bool) -> Result<Self> {
+    fn new(label: usize, blocked: bool) -> Result<Self> {
         let runtime = tokio::runtime::Builder::new_multi_thread()
             .worker_threads(1)
             .build()?;
@@ -166,6 +309,13 @@ impl Worker {
         let (thread_id, tid) = rx.recv_timeout(Duration::from_secs(3))?;
         let (monitor, events) =
             Supervisor::new(runtime.handle().clone()).spawn(Duration::from_millis(25))?;
+        let target = Target {
+            runtime: label,
+            worker: 0,
+            tid,
+            start_time: thread_start(std::process::id(), tid)?
+                .ok_or("worker exited at registration")?,
+        };
         let worker = Self {
             runtime,
             monitor: Some(monitor),
@@ -173,7 +323,7 @@ impl Worker {
             running,
             release: Some(release),
             progress,
-            tid,
+            target,
         };
         if !matches!(events.recv_timeout(Duration::from_secs(3))?, Event::Stalled { worker: 0, thread_id: observed, .. } if observed == thread_id)
         {
@@ -250,17 +400,12 @@ struct Client {
     ready_ns: u64,
 }
 impl Client {
-    fn start(tid: i32, mode: &str) -> Result<Self> {
+    fn start(mode: &str) -> Result<Self> {
         let start = Instant::now();
         let mut child = Command::new("timeout")
             .args(["--kill-after=1s", "15s", "prlimit", "--core=0:0", "--"])
             .arg(std::env::current_exe()?)
-            .args([
-                "--collector",
-                &std::process::id().to_string(),
-                &tid.to_string(),
-                mode,
-            ])
+            .args(["--collector", &std::process::id().to_string(), mode])
             .stdin(Stdio::piped())
             .stdout(Stdio::piped())
             .spawn()?;
@@ -296,9 +441,17 @@ impl Client {
         Ok(())
     }
 
-    fn capture(&mut self, held: impl FnOnce() -> Result<()>) -> Result<Sample> {
+    fn capture(
+        &mut self,
+        target: Target,
+        held: impl FnOnce() -> Result<()>,
+    ) -> Result<Option<Sample>> {
         let requested = Instant::now();
-        writeln!(self.child.stdin.as_mut().unwrap(), "capture")?;
+        writeln!(
+            self.child.stdin.as_mut().unwrap(),
+            "{}",
+            serde_json::to_string(&target)?
+        )?;
         self.read()?;
         if self.line.trim() == "stopped" {
             held()?;
@@ -307,9 +460,21 @@ impl Client {
             }
             self.read()?;
         }
-        let mut sample: Sample = serde_json::from_str(&self.line)?;
-        sample.request_ns = requested.elapsed().as_nanos() as u64;
-        Ok(sample)
+        match serde_json::from_str::<Response>(&self.line)? {
+            Response::Captured(mut sample) => {
+                if sample.target != target {
+                    return Err("collector replied for a different target".into());
+                }
+                sample.request_ns = requested.elapsed().as_nanos() as u64;
+                Ok(Some(sample))
+            }
+            Response::TargetUnavailable { target: reply } => {
+                if reply != target {
+                    return Err("collector rejected a different target".into());
+                }
+                Ok(None)
+            }
+        }
     }
 
     fn finish(&mut self) -> Result<()> {
@@ -348,7 +513,7 @@ fn check_held(worker: &Worker, heartbeat: &AtomicU64) -> Result<()> {
             .unwrap();
         assert_eq!(
             !tracer.ends_with("\t0"),
-            entry.file_name() == worker.tid.to_string().as_str()
+            entry.file_name() == worker.target.tid.to_string().as_str()
         );
     }
     thread::sleep(Duration::from_millis(20));
@@ -381,7 +546,7 @@ fn deadline(rx: mpsc::Receiver<bool>) {
     }
 }
 
-fn collector(pid: u32, tid: i32, mode: &str) -> Result<()> {
+fn collector(pid: u32, mode: &str) -> Result<()> {
     let (tx, rx) = mpsc::channel();
     thread::spawn(move || deadline(rx));
     let mut input = io::stdin().lock().lines();
@@ -395,14 +560,16 @@ fn collector(pid: u32, tid: i32, mode: &str) -> Result<()> {
     println!("{}", serde_json::to_string(&images)?);
     io::stdout().flush()?;
     while let Some(request) = input.next() {
-        if request? != "capture" {
-            return Err("unknown collector request".into());
+        let target: Target = serde_json::from_str(&request?)?;
+        if thread_start(pid, target.tid)? != Some(target.start_time) {
+            reply(&Response::TargetUnavailable { target })?;
+            continue;
         }
         tx.send(true)?;
-        let tid = Pid::from_raw(tid);
-        // Validate membership immediately before seizing; this controlled task
-        // stays alive until all requests finish. General TID reuse needs a lease.
-        let _ = fs::read_to_string(format!("/proc/{pid}/task/{tid}/stat"))?;
+        let tid = Pid::from_raw(target.tid);
+        // Runtimes created after this collector may allocate new stack mappings.
+        // Module code is still fixed in this controlled example.
+        let maps = mappings(pid)?;
         let memory = File::open(format!("/proc/{pid}/mem"))?;
         ptrace::seize(tid, ptrace::Options::empty())?;
         let start = Instant::now();
@@ -419,6 +586,12 @@ fn collector(pid: u32, tid: i32, mode: &str) -> Result<()> {
             // Do not swallow arbitrary application signals or job-control stops.
             // On any unexpected state, leave this helper: tracer death detaches.
             state => return Err(format!("unexpected tracee stop: {state:?}").into()),
+        }
+        if thread_start(pid, target.tid)? != Some(target.start_time) {
+            ptrace::detach(tid, None)?;
+            tx.send(false)?;
+            reply(&Response::TargetUnavailable { target })?;
+            continue;
         }
         if mode == "hold" || mode == "timeout" {
             println!("stopped");
@@ -484,16 +657,46 @@ fn collector(pid: u32, tid: i32, mode: &str) -> Result<()> {
         };
         tx.send(false)?;
         let sample = Sample {
+            target,
+            collector_pid: std::process::id(),
             interrupt_to_detach_ns: elapsed,
             request_ns: 0,
             stack_bytes: count,
             frames,
             termination,
         };
-        println!("{}", serde_json::to_string(&sample)?);
-        io::stdout().flush()?;
+        reply(&Response::Captured(sample))?;
     }
     Ok(())
+}
+
+fn reply(response: &Response) -> Result<()> {
+    println!("{}", serde_json::to_string(response)?);
+    io::stdout().flush()?;
+    Ok(())
+}
+
+fn thread_start(pid: u32, tid: i32) -> Result<Option<u64>> {
+    let stat = match fs::read_to_string(format!("/proc/{pid}/task/{tid}/stat")) {
+        Ok(stat) => stat,
+        Err(error)
+            if error.kind() == io::ErrorKind::NotFound
+                || error.raw_os_error() == Some(nix::libc::ESRCH) =>
+        {
+            return Ok(None)
+        }
+        Err(error) => return Err(error.into()),
+    };
+    // comm can contain spaces and parentheses. Fields after its closing ')' start
+    // at state (field 3); starttime is field 22, hence index 19 in this suffix.
+    let (_, fields) = stat.rsplit_once(") ").ok_or("invalid thread stat")?;
+    Ok(Some(
+        fields
+            .split_whitespace()
+            .nth(19)
+            .ok_or("missing starttime")?
+            .parse()?,
+    ))
 }
 
 struct Mapping {

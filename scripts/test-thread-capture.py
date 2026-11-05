@@ -11,6 +11,7 @@ import statistics
 import subprocess
 import sys
 import time
+from collections import Counter
 
 binary = Path(sys.argv[1]).resolve()
 directory = Path(sys.argv[2]).resolve()
@@ -32,7 +33,30 @@ def run(mode, success):
     if success:
         data = json.loads(report.read_text())
         samples = data["samples"]
-        assert len(samples) == (1 if mode == "hold" else 20)
+        assert data["version"] == 2
+        expected = {"hold": 1, "multi": 80, "multi-hold": 4}.get(mode, 20)
+        assert len(samples) == expected
+        assert len({s["collector_pid"] for s in samples}) == 1
+        assert all(s["target"]["worker"] == 0 for s in samples)
+        targets = {}
+        for sample in samples:
+            target = sample["target"]
+            assert target["start_time"] > 0 and target["tid"] > 0
+            assert targets.setdefault(target["runtime"], target) == target
+        if mode.startswith("multi"):
+            rounds = 1 if mode == "multi-hold" else 20
+            assert Counter(s["target"]["runtime"] for s in samples) == {0: rounds, 1: rounds * 2, 2: rounds}
+            assert targets[0]["tid"] != targets[1]["tid"]
+            assert targets[1]["tid"] != targets[2]["tid"]
+            # Runtime A has exited before C starts; Linux may reuse A's TID.
+            assert data["rejected"] == [targets[0], dict(targets[1], start_time=targets[1]["start_time"] + 1)]
+            assert "exited and mismatched targets rejected without restarting collector" in result.stdout
+            if mode == "multi-hold":
+                assert "runtime A shut down while runtime B remained held" in result.stdout
+                assert result.stdout.count("only target traced; reporter and heartbeat progressed") == 4
+        else:
+            assert set(targets) == {0}
+            assert data["rejected"] == []
         assert all(0 < s["stack_bytes"] <= 65536 for s in samples)
         if mode == "short-stack":
             assert all(s["stack_bytes"] == 8 for s in samples)
@@ -73,7 +97,7 @@ def check_symbols(data, function):
     assert addresses
     symbols = subprocess.check_output(["addr2line", "-a", "-C", "-f", "-i", "-e", str(binary)] +
                                       [hex(a) for a in addresses], text=True)
-    (directory / f"symbols-{function}.txt").write_text(symbols)
+    (directory / f"symbols-{function}-{len(data['samples'])}.txt").write_text(symbols)
     names = {}
     for line in symbols.splitlines():
         if re.fullmatch(r"0x[0-9a-fA-F]+", line):
@@ -83,11 +107,13 @@ def check_symbols(data, function):
             names[current] += line + "\n"
     for sample in data["samples"]:
         assert any(function in names.get(lookup(f), "") for f in sample["frames"])
-    print(f"all 20 snapshots resolve {function} after target exit")
+    print(f"all {len(data['samples'])} snapshots resolve {function} after target exit")
 
 
 check_symbols(run("normal", True), "busy_worker")
 check_symbols(run("blocked", True), "blocked_worker")
+check_symbols(run("multi", True), "busy_worker")
+check_symbols(run("multi-hold", True), "busy_worker")
 
 run("hold", True)
 run("short-stack", True)

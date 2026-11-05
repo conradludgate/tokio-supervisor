@@ -82,9 +82,13 @@ target lifetime and ptrace ownership.
 
 ## Build requirements
 
-Worker metrics require Tokio's unstable APIs. This repository enables
-`--cfg tokio_unstable` in `.cargo/config.toml`. Applications must enable it for
-their build too, including Tokio itself:
+Tokio 1.54.1 provides stable park/unpark metrics, but
+[`worker_poll_count`](https://docs.rs/tokio/1.54.1/tokio/runtime/struct.RuntimeMetrics.html#method.worker_poll_count)
+and [`worker_thread_id`](https://docs.rs/tokio/1.54.1/tokio/runtime/struct.RuntimeMetrics.html#method.worker_thread_id)
+still require `tokio_unstable`. The detector uses both to
+observe progress and thread handoffs, so the cfg is still needed. This repository
+enables it in `.cargo/config.toml`. Applications must enable it for their build
+too, including Tokio itself:
 
 ```sh
 RUSTFLAGS="--cfg tokio_unstable" cargo check
@@ -94,9 +98,9 @@ Cargo does not apply a dependency's `.cargo/config.toml` to its consumer. Append
 the cfg if your application already sets `RUSTFLAGS`.
 
 The checked baseline is Linux x86_64, Rust 1.99.1 and the retained lockfile with
-Tokio 1.40.0. Only the standard multi-thread runtime is supported. Zero intervals,
-current-thread runtimes and the experimental alternate scheduler are rejected
-before creating a watchdog thread. Other platform builds remain unvalidated.
+Tokio 1.54.1 (which requires Rust 1.85). Only the standard multi-thread runtime
+is supported. Zero intervals and current-thread runtimes are rejected before
+creating a watchdog thread. Other platform builds remain unvalidated.
 
 ```sh
 cargo test --all-targets --locked

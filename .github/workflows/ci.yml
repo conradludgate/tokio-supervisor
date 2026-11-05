@@ -21,3 +21,23 @@ jobs:
       - run: cargo test --doc --locked
       - run: cargo clippy --all-targets --locked -- -D warnings
       - run: cargo fmt --all --check
+
+  external-capture:
+    runs-on: ubuntu-latest
+    timeout-minutes: 10
+    steps:
+      - uses: actions/checkout@v4
+      - uses: dtolnay/rust-toolchain@stable
+      - run: sudo apt-get update && sudo apt-get install -y gdb
+      - run: mkdir -p .scratch/capture-tmp
+      - run: cargo build --example capture_gdb --locked
+        env:
+          TMPDIR: ${{ github.workspace }}/.scratch/capture-tmp
+      - run: python3 scripts/test-external-capture.py target/debug/examples/capture_gdb "$(command -v gdb)" .scratch/capture-checks
+      - uses: actions/upload-artifact@v4
+        if: failure()
+        with:
+          name: external-capture-reports
+          path: .scratch/capture-checks
+          include-hidden-files: true
+          retention-days: 7

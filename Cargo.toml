@@ -10,5 +10,8 @@ tokio = { version = "1.40", features = ["rt", "rt-multi-thread"] }
 axum = "0.7.5"
 tokio = { version = "1.40", features = ["full", "macros", "test-util"] }
 
+[target.'cfg(target_os = "linux")'.dev-dependencies]
+rustix = { version = "1.1.6", features = ["process"] }
+
 [profile.release]
 debug = true

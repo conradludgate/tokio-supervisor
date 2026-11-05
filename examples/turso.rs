@@ -1,11 +1,12 @@
+//! Manual deadlock demonstration: cargo run --example turso.
+//!
 //! <https://turso.tech/blog/how-to-deadlock-tokio-application-in-rust-with-just-a-single-mutex>
 
 use std::time::Duration;
 
 use tokio_supervisor::Supervisor;
 
-#[test]
-fn test() {
+fn main() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()

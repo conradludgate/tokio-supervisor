@@ -4,11 +4,11 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-tokio = { version = "1.40", features = ["rt", "rt-multi-thread"] }
+tokio = { version = "1.54.1", features = ["rt", "rt-multi-thread"] }
 
 [dev-dependencies]
 axum = "0.7.5"
-tokio = { version = "1.40", features = ["full", "macros", "test-util"] }
+tokio = { version = "1.54.1", features = ["full", "macros", "test-util"] }
 
 [target.'cfg(target_os = "linux")'.dev-dependencies]
 rustix = { version = "1.1.6", features = ["process"] }

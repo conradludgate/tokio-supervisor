@@ -11,12 +11,17 @@ fn main() {
     let rt = tokio::runtime::Builder::new_multi_thread()
         .worker_threads(2)
         .enable_all()
-        .on_thread_start(tokio_supervisor::on_thread_start)
-        .on_thread_stop(tokio_supervisor::on_thread_stop)
         .build()
         .unwrap();
 
-    Supervisor::new(rt.handle().clone()).spawn(Duration::from_millis(100));
+    let (monitor, events) = Supervisor::new(rt.handle().clone())
+        .spawn(Duration::from_millis(100))
+        .unwrap();
+    let reporter = std::thread::spawn(move || {
+        while let Ok(event) = events.recv() {
+            eprintln!("{event:?}");
+        }
+    });
 
     let svc = axum::Router::new()
         .route("/fast", get(|| async {}))
@@ -35,5 +40,7 @@ fn main() {
         axum::serve(TcpListener::bind("127.0.0.1:8123").await.unwrap(), svc)
             .await
             .unwrap()
-    })
+    });
+    monitor.shutdown().unwrap();
+    reporter.join().unwrap();
 }

@@ -1,135 +1,116 @@
 # tokio-supervisor
 
-Work in progress
+An experimental watchdog for Tokio runtime workers. It reports an active worker
+that has shown no poll progress for a sustained interval, followed by a recovery
+event when progress, parking, or a thread handoff clears the observation.
 
-## What is this?
+Sampling uses an independent OS thread, so it continues when every monitored
+worker is blocked. Events go to a bounded channel; a slow reporter cannot block
+sampling. This version does not install signal handlers or capture stack traces.
 
-This is a library that hooks into your tokio runtime (using unstable features) to monitor your runtime
-threads for suspicious tasks that are blocking the thread. The implementation
-uses POSIX signals and pthreads; Windows support is not implemented.
+## Use
 
-In the future, it will also attempt to spawn some new worker threads to pick up the slack to try
-and improve efficiency and unblock your application in the rare event that all your tasks end up blocking.
+```rust
+use std::time::Duration;
+use tokio_supervisor::Supervisor;
+
+let runtime = tokio::runtime::Builder::new_multi_thread()
+    .worker_threads(2)
+    .build()?;
+let (monitor, events) = Supervisor::new(runtime.handle().clone())
+    .spawn(Duration::from_millis(100))?;
+
+// Reporting also runs outside the monitored runtime, so a complete worker stall
+// cannot prevent it from printing events.
+let reporter = std::thread::spawn(move || {
+    while let Ok(event) = events.recv() {
+        eprintln!("{event:?}");
+    }
+});
+
+runtime.block_on(async { /* application work */ });
+monitor.shutdown().expect("watchdog thread panicked");
+reporter.join().expect("reporter thread panicked");
+# Ok::<(), std::io::Error>(())
+```
+
+Keep the returned `Monitor` alive. Dropping it stops and joins the watchdog;
+`shutdown` does the same and returns any watchdog thread panic. Shutdown wakes
+the watchdog without waiting for its sampling interval or application tasks.
+
+Events use the standard-library synchronous receiver. Consume them on an
+independent reporting thread; blocking a Tokio worker on this receiver can itself
+stall the runtime. A bounded standard-library channel avoids running application
+wake callbacks on the watchdog thread. Applications can bridge events to their
+async reporting system outside the watchdog.
+
+`interval` controls both the sampling period and the minimum observed no-progress
+time. Only state transitions are emitted. The queue holds two events per worker;
+when full, new events are dropped and counted by `Monitor::dropped_events`.
+Recovery can therefore arrive without its earlier stall event. Receiver
+disconnection is noticed when the watchdog next publishes an event. Dropping the
+monitor or calling shutdown wakes it immediately, even when workers are idle.
+
+## What an event means
+
+This detects lack of observed worker progress, not proof of deadlock. Long
+CPU-bound polls and OS descheduling can also trigger events. Poll counts can be
+published in batches and the sampled metrics are not one atomic snapshot.
+
+`Event::Stalled` contains the logical worker index, its sampled Rust thread ID,
+and time since progress was last observed. The duration is not an exact task-poll
+duration. Idle/parked workers and workers that have not started are skipped.
+Changing worker thread identity resets the observation period.
+
+`Event::Recovered` refers to the thread ID of the earlier stall. A worker can
+recover by parking or handing its scheduler state to a replacement, such as with
+`block_in_place`; this does not prove that the original application task completed.
+
+No per-task callbacks are installed. This version does not identify which task
+is running, unwind an interrupted stack, or add replacement runtime workers.
+Stack collection needs a separate backend with its own lifetime and safety contract.
 
 ## Build requirements
 
-The worker metrics require Tokio's unstable APIs. This repository enables
-`--cfg tokio_unstable` in `.cargo/config.toml`. Applications using this crate as a
-dependency must enable the same cfg for their build, including Tokio itself:
+Worker metrics require Tokio's unstable APIs. This repository enables
+`--cfg tokio_unstable` in `.cargo/config.toml`. Applications must enable it for
+their build too, including Tokio itself:
 
 ```sh
 RUSTFLAGS="--cfg tokio_unstable" cargo check
 ```
 
-Cargo does not apply a dependency's `.cargo/config.toml` to its consumer. If
-your application already sets `RUSTFLAGS`, append the cfg to those flags.
+Cargo does not apply a dependency's `.cargo/config.toml` to its consumer. Append
+the cfg if your application already sets `RUSTFLAGS`.
 
-The checked build baseline is Linux x86_64, Rust 1.99.1, and the repository's
-Cargo.lock (Tokio 1.40.0). Tokio's unstable interfaces can change when updating
-dependencies. Other platform builds and capture backends are not validated by
-these checks.
+The checked baseline is Linux x86_64, Rust 1.99.1 and the retained lockfile with
+Tokio 1.40.0. Only the standard multi-thread runtime is supported. Zero intervals,
+current-thread runtimes and the experimental alternate scheduler are rejected
+before creating a watchdog thread. Other platform builds remain unvalidated.
 
-From this repository, use `cargo check --locked --lib` for the normal dependency
-configuration and `cargo test --locked --no-run` to compile the manual harnesses.
-The existing tests serve HTTP or intentionally run indefinitely; `--no-run`
-checks compilation and is not a successful runtime test.
-
-## Current limitations
-
-This is an experimental capture path. Its native unwinder's async-signal safety
-is not established by a successful build. Capture requests can wait indefinitely
-for a response, and responses are not correlated with individual requests.
-The sampler runs on the monitored runtime, so it cannot make progress while all
-of that runtime's workers are blocked. These require separate design work.
-
-## How does it work?
-
-Using `RuntimeMetrics::worker_poll_count`, we can detect when a worker is no longer making progress. If the poll
-count does not increase after some duration, it is flagged as blocking (it could also be parked, which we also test for). If the thread
-is detected as blocking, we send a signal to that thread.
-
-Additionally, we set up a global channel and signal handler on all threads to respond to this signal.
-It handles the signal by capturing a backtrace and sending it over the channel. By capturing the backtrace,
-it makes it much easier to debug what is causing the runtime worker to become blocked.
-
-## How will it handle spawning new workers?
-
-Tokio has a mechanism built in to spawn a new temporary worker thread called `block_in_place`. Unfortunately
-it will reclaim the worker state once the block_in_place method completes. We would need to move this logic
-so that tokio only reclaims the worker state once the task unblocks itself.
-
-## Example
-
-```rust
-#[tokio::main(flavor = "multi_thread", worker_threads = 2)]
-async fn main() {
-    // Create a new supervisor and attach it to the current runtime.
-    // Spawn the supervisor thread to sample all workers every 100ms.
-    Supervisor::new(tokio::runtime::Handle::current()).spawn(Duration::from_millis(100));
-
-    // Run some workload in the runtime.
-    let svc = axum::Router::new()
-        .route("/fast", get(|| async {}))
-        // will block the runtime when this API is hit.
-        .route(
-            "/slow",
-            get(|| async { std::thread::sleep(Duration::from_secs(5)) }),
-        )
-        .with_state(())
-        .into_make_service();
-    axum::serve(TcpListener::bind("0.0.0.0:8123").await.unwrap(), svc)
-        .await
-        .unwrap()
-}
+```sh
+cargo test --all-targets --locked
+cargo test --doc --locked
 ```
 
-Calling `http://localhost:8123/fast` shows nothing. Calling `http://localhost:8123/slow` prints
+The HTTP and deliberately deadlocking Turso examples are manual demonstrations:
 
-```
-worker thread 1 is blocked (673097 == 673097)
-backtrace::backtrace::libunwind::trace::h99d4c3ef5d4daf63
- -> "/Users/conrad/.cargo/registry/src/index.crates.io-6f17d22bba15001f/backtrace-0.3.73/src/backtrace/libunwind.rs"
-backtrace::backtrace::trace_unsynchronized::h9b3887e61be83d18
- -> "/Users/conrad/.cargo/registry/src/index.crates.io-6f17d22bba15001f/backtrace-0.3.73/src/backtrace/mod.rs"
-tokio_supervisor::tests::get_backtrace2::hedb14cb7a09bf091
- -> "/Users/conrad/Documents/code/tokio-supervisor/src/lib.rs"
-signal_hook_registry::handler::hffda5a27bfe9fd9b
- -> "/Users/conrad/.cargo/registry/src/index.crates.io-6f17d22bba15001f/signal-hook-registry-1.4.2/src/lib.rs"
-__simple_esappend
-std::sys::pal::unix::thread::Thread::sleep::ha9be65893542756d
- -> "/rustc/3f5fd8dd41153bc5fdca9427e9e05be2c767ba23/library/std/src/sys/pal/unix/thread.rs"
-std::thread::sleep::h68e6720733935c56
- -> "/rustc/3f5fd8dd41153bc5fdca9427e9e05be2c767ba23/library/std/src/thread/mod.rs"
-tokio_supervisor::tests::it_works::{{closure}}::{{closure}}::{{closure}}::h7baafb1d89b51864
- -> "/Users/conrad/Documents/code/tokio-supervisor/src/lib.rs"
-<F as axum::handler::Handler<((),),S>>::call::{{closure}}::hdab8fd20326fa8e7
- -> "/Users/conrad/.cargo/registry/src/index.crates.io-6f17d22bba15001f/axum-0.7.5/src/handler/mod.rs"
-<core::pin::Pin<P> as core::future::future::Future>::poll::h236b098ffeea1b99
- -> "/rustc/3f5fd8dd41153bc5fdca9427e9e05be2c767ba23/library/core/src/future/future.rs"
-<futures_util::future::future::map::Map<Fut,F> as core::future::future::Future>::poll::hfdd9947fda4e1606
- -> "/Users/conrad/.cargo/registry/src/index.crates.io-6f17d22bba15001f/futures-util-0.3.30/src/future/future/map.rs"
-<futures_util::future::future::Map<Fut,F> as core::future::future::Future>::poll::h23cd2e63b5ba6313
- -> "/Users/conrad/.cargo/registry/src/index.crates.io-6f17d22bba15001f/futures-util-0.3.30/src/lib.rs"
-<axum::handler::future::IntoServiceFuture<F> as core::future::future::Future>::poll::hf95ed4d49ff0ba63
- -> "/Users/conrad/.cargo/registry/src/index.crates.io-6f17d22bba15001f/axum-0.7.5/src/macros.rs"
-<F as futures_core::future::TryFuture>::try_poll::h1ad9def16d43a26e
- -> "/Users/conrad/.cargo/registry/src/index.crates.io-6f17d22bba15001f/futures-core-0.3.30/src/future.rs"
-<futures_util::future::try_future::into_future::IntoFuture<Fut> as core::future::future::Future>::poll::h76645dc11ea53258
- -> "/Users/conrad/.cargo/registry/src/index.crates.io-6f17d22bba15001f/futures-util-0.3.30/src/future/try_future/into_future.rs"
-<futures_util::future::future::map::Map<Fut,F> as core::future::future::Future>::poll::hf796f107af9e2d56
- -> "/Users/conrad/.cargo/registry/src/index.crates.io-6f17d22bba15001f/futures-util-0.3.30/src/future/future/map.rs
+```sh
+cargo run --example http
+cargo run --example turso
 ```
 
-There's a lot of noise here, but if we filter down the output, we do see our `std::thread::sleep` inside an axum handler
+The HTTP demo listens on `127.0.0.1:8123`. `/slow` blocks a worker; repeated
+concurrent requests can occupy both. `/block_in_place` demonstrates handing the
+logical worker to a replacement. These servers are not automated tests.
 
-```
-worker thread 1 is blocked (673097 == 673097)
-...
-std::thread::sleep::h68e6720733935c56
- -> "/rustc/3f5fd8dd41153bc5fdca9427e9e05be2c767ba23/library/std/src/thread/mod.rs"
-tokio_supervisor::tests::it_works::{{closure}}::{{closure}}::{{closure}}::h7baafb1d89b51864
- -> "/Users/conrad/Documents/code/tokio-supervisor/src/lib.rs"
-<F as axum::handler::Handler<((),),S>>::call::{{closure}}::hdab8fd20326fa8e7
- -> "/Users/conrad/.cargo/registry/src/index.crates.io-6f17d22bba15001f/axum-0.7.5/src/handler/mod.rs"
-...
-```
+## Migration from the signal-capture prototype
+
+`Supervisor::new(handle)` remains, but `spawn(interval)` now returns a
+`Result<(Monitor, Receiver<Event>)>`. Keep the monitor and consume events instead
+of relying on automatic stack printing. The old native-thread registration hooks
+and `Backtrace`/`BacktraceSymbol` types are removed. No process-global signal or
+native unwinder is used. This is an intentional breaking change to the unpublished
+prototype; stack capture will be considered separately.
+Applications needing Tokio timers or channels must enable the corresponding
+Tokio features themselves; the detector requests only runtime features.

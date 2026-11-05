@@ -70,6 +70,10 @@ No per-task callbacks are installed. This version does not identify which task
 is running, unwind an interrupted stack, or add replacement runtime workers.
 Stack collection needs a separate backend with its own lifetime and safety contract.
 
+The Linux [external GDB capture experiment](docs/external-capture.md) collects a
+one-shot process snapshot after a stall event. It pauses the whole application
+and is an opt-in example, with an external deadline and bounded collector output.
+
 ## Build requirements
 
 Worker metrics require Tokio's unstable APIs. This repository enables

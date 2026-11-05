@@ -4,7 +4,7 @@ use std::{
     io::{self, BufRead, BufReader, Write},
     ops::Range,
     os::unix::{fs::FileExt, fs::OpenOptionsExt},
-    process::{Child, Command, Stdio},
+    process::{Child, ChildStdout, Command, Stdio},
     sync::{
         atomic::{AtomicBool, AtomicU64, Ordering},
         mpsc, Arc,
@@ -101,150 +101,103 @@ pub fn run() -> Result<()> {
         .create_new(true)
         .mode(0o600)
         .open(report)?;
-    let rt = tokio::runtime::Builder::new_multi_thread()
-        .worker_threads(1)
-        .build()?;
-    let running = Arc::new(AtomicBool::new(true));
-    let _stop = Stop(running.clone());
-    let progress = Arc::new(AtomicU64::new(0));
-    let heartbeat = Arc::new(AtomicU64::new(0));
-    let beat = {
-        let (running, heartbeat) = (running.clone(), heartbeat.clone());
-        thread::spawn(move || {
-            while running.load(Ordering::Relaxed) {
-                heartbeat.fetch_add(1, Ordering::Relaxed);
-                thread::sleep(Duration::from_millis(1));
-            }
-        })
-    };
-    let (tx, rx) = mpsc::channel();
-    let (release, wait) = mpsc::channel::<()>();
-    let blocked = mode == "blocked";
-    let task = {
-        let (running, progress) = (running.clone(), progress.clone());
-        rt.spawn(async move {
-            tx.send((thread::current().id(), gettid().as_raw()))
-                .unwrap();
-            if blocked {
-                blocked_worker(wait);
-            } else {
-                busy_worker(&running, &progress);
-            }
-        })
-    };
-    let (thread_id, tid) = rx.recv_timeout(Duration::from_secs(3))?;
-    let (monitor, events) =
-        Supervisor::new(rt.handle().clone()).spawn(Duration::from_millis(25))?;
+    let heartbeat = Heartbeat::new();
+    let mut worker = Worker::new(mode == "blocked")?;
     let result = (|| -> Result<()> {
-        let event = events.recv_timeout(Duration::from_secs(3))?;
-        if !matches!(event, Event::Stalled { thread_id: observed, .. } if observed == thread_id) {
-            return Err("stall did not identify the registered task thread".into());
+        let mut client = Client::start(worker.tid, mode)?;
+        let mut samples = Vec::new();
+        for _ in 0..if mode == "hold" { 1 } else { 20 } {
+            samples.push(client.capture(|| check_held(&worker, &heartbeat.progress))?);
+            assert_untraced(worker.tid)?;
         }
-        let spawning = Instant::now();
-        let mut child = Client(
-            Command::new("timeout")
-                .args(["--kill-after=1s", "15s", "prlimit", "--core=0:0", "--"])
-                .arg(std::env::current_exe()?)
-                .args([
-                    "--collector",
-                    &std::process::id().to_string(),
-                    &tid.to_string(),
-                    mode,
-                ])
-                .stdin(Stdio::piped())
-                .stdout(Stdio::piped())
-                .spawn()?,
-        );
-        if mode != "no-permission" {
-            // This standalone example owns the designated-ptracer slot, just
-            // like capture_gdb. Do not silently install this in a library.
-            set_ptracer(PTracer::ProcessID(rustix::process::Pid::from_child(
-                &child.0,
-            )))?;
-        }
-        let result = (|| -> Result<()> {
-            let mut input = child.0.stdin.take().unwrap();
-            let mut replies = BufReader::new(child.0.stdout.take().unwrap());
-            writeln!(input, "start")?;
-            let mut line = String::new();
-            replies.read_line(&mut line)?;
-            if line.is_empty() {
-                return Err("collector did not become ready".into());
-            }
-            let images = serde_json::from_str::<Vec<Image>>(&line)?;
-            let collector_ready_ns = spawning.elapsed().as_nanos() as u64;
-            let mut samples = Vec::new();
-            for _ in 0..if mode == "hold" { 1 } else { 20 } {
-                let requested = Instant::now();
-                writeln!(input, "capture")?;
-                line.clear();
-                if replies.read_line(&mut line)? == 0 {
-                    return Err("collector exited during capture".into());
-                }
-                if line.trim() == "stopped" {
-                    // Fault probe only: the helper deliberately holds the selected
-                    // thread, while this reporter and the heartbeat keep running.
-                    let before = heartbeat.load(Ordering::Relaxed);
-                    let worker = progress.load(Ordering::Relaxed);
-                    for entry in fs::read_dir("/proc/self/task")? {
-                        let entry = entry?;
-                        let status = fs::read_to_string(entry.path().join("status"))?;
-                        let tracer = status
-                            .lines()
-                            .find(|l| l.starts_with("TracerPid:"))
-                            .unwrap();
-                        assert_eq!(
-                            !tracer.ends_with("\t0"),
-                            entry.file_name() == tid.to_string().as_str()
-                        );
-                    }
-                    thread::sleep(Duration::from_millis(20));
-                    assert_eq!(progress.load(Ordering::Relaxed), worker);
-                    assert!(heartbeat.load(Ordering::Relaxed) > before);
-                    println!("only target traced; reporter and heartbeat progressed");
-                    if mode == "hold" {
-                        writeln!(input, "resume")?;
-                    }
-                    line.clear();
-                    if replies.read_line(&mut line)? == 0 {
-                        return Err("collector exited while target stopped".into());
-                    }
-                }
-                let mut sample = serde_json::from_str::<Sample>(&line)?;
-                sample.request_ns = requested.elapsed().as_nanos() as u64;
-                samples.push(sample);
-                let status = fs::read_to_string(format!("/proc/self/task/{tid}/status"))?;
-                assert!(status.lines().any(|line| line == "TracerPid:\t0"));
-            }
-            drop(input);
-            if !child.0.wait()?.success() {
-                return Err("collector failed".into());
-            }
-            println!("completed {} captures with one collector", samples.len());
-            serde_json::to_writer(
-                output,
-                &Report {
-                    version: 1,
-                    architecture: "x86_64",
-                    tid,
-                    collector_ready_ns,
-                    images,
-                    samples,
-                },
-            )?;
-            Ok(())
-        })();
-        // Also reset on helper failure, before propagating that failure.
-        set_ptracer(PTracer::None)?;
-        result
+        client.finish()?;
+        println!("completed {} captures with one collector", samples.len());
+        serde_json::to_writer(
+            output,
+            &Report {
+                version: 1,
+                architecture: "x86_64",
+                tid: worker.tid,
+                collector_ready_ns: client.ready_ns,
+                images: std::mem::take(&mut client.images),
+                samples,
+            },
+        )?;
+        Ok(())
     })();
-    monitor.shutdown().map_err(|_| "watchdog panicked")?;
-    running.store(false, Ordering::Relaxed);
-    drop(release);
-    rt.block_on(task)?;
-    beat.join().map_err(|_| "heartbeat panicked")?;
+    worker.stop()?;
     println!("target resumed; blocked worker completed");
     result
+}
+
+// The demo owns these tasks until capture completes. Runtime shutdown releases
+// their flag/channel and joins them before dropping their runtime.
+struct Worker {
+    runtime: tokio::runtime::Runtime,
+    monitor: Option<tokio_supervisor::Monitor>,
+    task: Option<tokio::task::JoinHandle<()>>,
+    running: Stop,
+    release: Option<mpsc::Sender<()>>,
+    progress: Arc<AtomicU64>,
+    tid: i32,
+}
+
+impl Worker {
+    fn new(blocked: bool) -> Result<Self> {
+        let runtime = tokio::runtime::Builder::new_multi_thread()
+            .worker_threads(1)
+            .build()?;
+        let running = Stop(Arc::new(AtomicBool::new(true)));
+        let progress = Arc::new(AtomicU64::new(0));
+        let (tx, rx) = mpsc::channel();
+        let (release, wait) = mpsc::channel::<()>();
+        let task = {
+            let (running, progress) = (running.0.clone(), progress.clone());
+            runtime.spawn(async move {
+                tx.send((thread::current().id(), gettid().as_raw()))
+                    .unwrap();
+                if blocked {
+                    blocked_worker(wait);
+                } else {
+                    busy_worker(&running, &progress);
+                }
+            })
+        };
+        let (thread_id, tid) = rx.recv_timeout(Duration::from_secs(3))?;
+        let (monitor, events) =
+            Supervisor::new(runtime.handle().clone()).spawn(Duration::from_millis(25))?;
+        let worker = Self {
+            runtime,
+            monitor: Some(monitor),
+            task: Some(task),
+            running,
+            release: Some(release),
+            progress,
+            tid,
+        };
+        if !matches!(events.recv_timeout(Duration::from_secs(3))?, Event::Stalled { worker: 0, thread_id: observed, .. } if observed == thread_id)
+        {
+            return Err("stall did not identify the registered task thread".into());
+        }
+        Ok(worker)
+    }
+
+    fn stop(&mut self) -> Result<()> {
+        self.running.0.store(false, Ordering::Relaxed);
+        self.release.take();
+        if let Some(monitor) = self.monitor.take() {
+            monitor.shutdown().map_err(|_| "watchdog panicked")?;
+        }
+        if let Some(task) = self.task.take() {
+            self.runtime.block_on(task)?;
+        }
+        Ok(())
+    }
+}
+impl Drop for Worker {
+    fn drop(&mut self) {
+        let _ = self.stop();
+    }
 }
 
 struct Stop(Arc<AtomicBool>);
@@ -253,12 +206,156 @@ impl Drop for Stop {
         self.0.store(false, Ordering::Relaxed);
     }
 }
-struct Client(Child);
+struct Heartbeat {
+    running: Stop,
+    progress: Arc<AtomicU64>,
+    thread: Option<thread::JoinHandle<()>>,
+}
+impl Heartbeat {
+    fn new() -> Self {
+        let running = Stop(Arc::new(AtomicBool::new(true)));
+        let progress = Arc::new(AtomicU64::new(0));
+        let thread = {
+            let (running, progress) = (running.0.clone(), progress.clone());
+            thread::spawn(move || {
+                while running.load(Ordering::Relaxed) {
+                    progress.fetch_add(1, Ordering::Relaxed);
+                    thread::sleep(Duration::from_millis(1));
+                }
+            })
+        };
+        Self {
+            running,
+            progress,
+            thread: Some(thread),
+        }
+    }
+}
+impl Drop for Heartbeat {
+    fn drop(&mut self) {
+        self.running.0.store(false, Ordering::Relaxed);
+        if let Some(thread) = self.thread.take() {
+            let _ = thread.join();
+        }
+    }
+}
+
+struct Client {
+    child: Child,
+    replies: BufReader<ChildStdout>,
+    line: String,
+    permission: bool,
+    resume_probe: bool,
+    images: Vec<Image>,
+    ready_ns: u64,
+}
+impl Client {
+    fn start(tid: i32, mode: &str) -> Result<Self> {
+        let start = Instant::now();
+        let mut child = Command::new("timeout")
+            .args(["--kill-after=1s", "15s", "prlimit", "--core=0:0", "--"])
+            .arg(std::env::current_exe()?)
+            .args([
+                "--collector",
+                &std::process::id().to_string(),
+                &tid.to_string(),
+                mode,
+            ])
+            .stdin(Stdio::piped())
+            .stdout(Stdio::piped())
+            .spawn()?;
+        let replies = BufReader::new(child.stdout.take().unwrap());
+        let mut client = Self {
+            child,
+            replies,
+            line: String::new(),
+            permission: false,
+            resume_probe: mode == "hold",
+            images: Vec::new(),
+            ready_ns: 0,
+        };
+        if mode != "no-permission" {
+            // One session owns the process's designated-ptracer slot.
+            set_ptracer(PTracer::ProcessID(rustix::process::Pid::from_child(
+                &client.child,
+            )))?;
+            client.permission = true;
+        }
+        writeln!(client.child.stdin.as_mut().unwrap(), "start")?;
+        client.read()?;
+        client.images = serde_json::from_str(&client.line)?;
+        client.ready_ns = start.elapsed().as_nanos() as u64;
+        Ok(client)
+    }
+
+    fn read(&mut self) -> Result<()> {
+        self.line.clear();
+        if self.replies.read_line(&mut self.line)? == 0 {
+            return Err("collector exited during capture".into());
+        }
+        Ok(())
+    }
+
+    fn capture(&mut self, held: impl FnOnce() -> Result<()>) -> Result<Sample> {
+        let requested = Instant::now();
+        writeln!(self.child.stdin.as_mut().unwrap(), "capture")?;
+        self.read()?;
+        if self.line.trim() == "stopped" {
+            held()?;
+            if self.resume_probe {
+                writeln!(self.child.stdin.as_mut().unwrap(), "resume")?;
+            }
+            self.read()?;
+        }
+        let mut sample: Sample = serde_json::from_str(&self.line)?;
+        sample.request_ns = requested.elapsed().as_nanos() as u64;
+        Ok(sample)
+    }
+
+    fn finish(&mut self) -> Result<()> {
+        self.child.stdin.take();
+        let status = self.child.wait()?;
+        if self.permission {
+            set_ptracer(PTracer::None)?;
+            self.permission = false;
+        }
+        if !status.success() {
+            return Err("collector failed".into());
+        }
+        Ok(())
+    }
+}
 impl Drop for Client {
     fn drop(&mut self) {
-        self.0.stdin.take();
-        let _ = self.0.wait();
+        let _ = self.finish();
     }
+}
+
+fn assert_untraced(tid: i32) -> Result<()> {
+    let status = fs::read_to_string(format!("/proc/self/task/{tid}/status"))?;
+    assert!(status.lines().any(|line| line == "TracerPid:\t0"));
+    Ok(())
+}
+fn check_held(worker: &Worker, heartbeat: &AtomicU64) -> Result<()> {
+    let before = heartbeat.load(Ordering::Relaxed);
+    let progress = worker.progress.load(Ordering::Relaxed);
+    for entry in fs::read_dir("/proc/self/task")? {
+        let entry = entry?;
+        let status = fs::read_to_string(entry.path().join("status"))?;
+        let tracer = status
+            .lines()
+            .find(|line| line.starts_with("TracerPid:"))
+            .unwrap();
+        assert_eq!(
+            !tracer.ends_with("\t0"),
+            entry.file_name() == worker.tid.to_string().as_str()
+        );
+    }
+    thread::sleep(Duration::from_millis(20));
+    assert_eq!(worker.progress.load(Ordering::Relaxed), progress);
+    assert!(heartbeat.load(Ordering::Relaxed) > before);
+    println!("only target traced; reporter and heartbeat progressed");
+    Ok(())
 }
 
 #[inline(never)]

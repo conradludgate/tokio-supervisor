@@ -348,7 +348,12 @@ fn collector(pid: u32, tid: i32, mode: &str) -> Result<()> {
         let count = budget.min((range.range.end - base) as usize);
         // The error probe occurs after stop, so kernel detach-on-exit is tested.
         let address = if mode == "read-error" { u64::MAX } else { base };
-        memory.read_exact_at(&mut stack[..count], address)?;
+        // A mapping need not be readable through its end. Retain the readable
+        // prefix; the bounded unwind callback reports any missing older frames.
+        let count = memory.read_at(&mut stack[..count], address)?;
+        if count == 0 {
+            return Err("empty stack snapshot".into());
+        }
         ptrace::detach(tid, None)?;
         let elapsed = start.elapsed().as_nanos() as u64;
         // Everything below uses owned bytes. No remote memory is read or thread

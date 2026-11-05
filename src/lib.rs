@@ -1,310 +1,263 @@
-use core::fmt;
+//! Detect sustained lack of progress on Tokio runtime workers.
+//!
+//! Sampling runs on its own OS thread. It continues when every monitored worker
+//! is blocked and never waits for event consumers. This crate does not install
+//! signal handlers or capture stacks.
+
 use std::{
-    hint::spin_loop,
-    path::PathBuf,
-    sync::{OnceLock, RwLock},
-    thread::ThreadId,
-    time::Duration,
+    io,
+    sync::{
+        atomic::{AtomicUsize, Ordering},
+        mpsc::{self, Receiver, TrySendError},
+        Arc,
+    },
+    thread::{self, JoinHandle, ThreadId},
+    time::{Duration, Instant},
 };
 
-use backtrace::{BacktraceFmt, BytesOrWideString, PrintFmt, SymbolName};
-use foldhash::HashMap;
-use libc::{pthread_kill, SIGPROF};
-use signal_hook::low_level::channel::Channel;
-use tokio::runtime::RuntimeMetrics;
+use tokio::runtime::{Handle, RuntimeFlavor, RuntimeMetrics};
 
-const FRAMES: usize = 16;
-
-type BtChan = Channel<arrayvec::ArrayVec<backtrace::Frame, FRAMES>>;
-static BACKTRACE_HOOK: OnceLock<BtChan> = OnceLock::new();
-
-pub struct Backtrace {
-    // Frames here are listed from top-to-bottom of the stack
-    frames: Vec<BacktraceFrame>,
+/// A change in a logical runtime worker's observed progress.
+///
+/// These are diagnostic observations, not proof of a deadlock. A long CPU-bound
+/// poll or OS descheduling can also cause a stall. Metrics are sampled separately
+/// and Tokio can publish poll counts in batches.
+#[derive(Debug, Clone, Copy, PartialEq, Eq)]
+pub enum Event {
+    /// An active worker has shown no poll progress for at least one interval.
+    Stalled {
+        worker: usize,
+        thread_id: ThreadId,
+        /// Time since progress was last observed, not an exact poll duration.
+        duration: Duration,
+    },
+    /// A previously stalled worker made progress, parked, or changed identity.
+    ///
+    /// The thread ID identifies the earlier stall. A handoff can restore worker
+    /// capacity without completing the task that originally occupied that thread.
+    Recovered {
+        worker: usize,
+        thread_id: ThreadId,
+        /// Time since progress was last observed before this stall.
+        duration: Duration,
+    },
 }
 
-struct BacktraceFrame {
-    // frame: backtrace::Frame,
-    ip: *mut libc::c_void,
-    symbols: Vec<BacktraceSymbol>,
-}
-
-pub struct BacktraceSymbol {
-    name: Option<Vec<u8>>,
-    filename: Option<PathBuf>,
-    lineno: Option<u32>,
-    colno: Option<u32>,
-}
-
-impl fmt::Debug for Backtrace {
-    fn fmt(&self, fmt: &mut fmt::Formatter<'_>) -> fmt::Result {
-        let style = if fmt.alternate() {
-            PrintFmt::Full
-        } else {
-            PrintFmt::Short
-        };
-
-        // When printing paths we try to strip the cwd if it exists, otherwise
-        // we just print the path as-is. Note that we also only do this for the
-        // short format, because if it's full we presumably want to print
-        // everything.
-        let cwd = std::env::current_dir();
-        let mut print_path = move |fmt: &mut fmt::Formatter<'_>, path: BytesOrWideString<'_>| {
-            let path = path.into_path_buf();
-            if style == PrintFmt::Full {
-                if let Ok(cwd) = &cwd {
-                    if let Ok(suffix) = path.strip_prefix(cwd) {
-                        return fmt::Display::fmt(&suffix.display(), fmt);
-                    }
-                }
-            }
-            fmt::Display::fmt(&path.display(), fmt)
-        };
-
-        let mut f = BacktraceFmt::new(fmt, style, &mut print_path);
-        f.add_context()?;
-        for frame in &self.frames {
-            let mut fr = f.frame();
-            for symbol in &frame.symbols {
-                fr.print_raw_with_column(
-                    frame.ip,
-                    symbol.name.as_ref().map(|s| SymbolName::new(s)),
-                    // TODO: this isn't great that we don't end up printing anything
-                    // with non-utf8 filenames. Thankfully almost everything is utf8 so
-                    // this shouldn't be too bad.
-                    symbol
-                        .filename
-                        .as_ref()
-                        .and_then(|p| Some(BytesOrWideString::Bytes(p.to_str()?.as_bytes()))),
-                    symbol.lineno,
-                    symbol.colno,
-                )?;
-            }
-            if frame.symbols.is_empty() {
-                fr.print_raw(frame.ip, None, None, None)?;
-            }
-        }
-        f.finish()?;
-        Ok(())
-    }
-}
-
-fn register_backtrace() -> &'static BtChan {
-    let mut init = false;
-    let channel = BACKTRACE_HOOK.get_or_init(|| {
-        init = true;
-        Channel::new()
-    });
-
-    if init {
-        unsafe {
-            signal_hook::low_level::register(SIGPROF, move || fulfill_backtrace(channel)).unwrap()
-        };
-    }
-
-    channel
-}
-
-fn request_backtrace(thread: libc::pthread_t, channel: &BtChan) {
-    unsafe { pthread_kill(thread, SIGPROF) };
-
-    loop {
-        let Some(frames) = channel.recv() else {
-            spin_loop();
-            continue;
-        };
-
-        let mut bt = Backtrace { frames: vec![] };
-
-        for frame in frames {
-            let mut f = BacktraceFrame {
-                ip: frame.ip(),
-                symbols: vec![],
-            };
-            backtrace::resolve_frame(&frame, |symbol| {
-                let symbol = BacktraceSymbol {
-                    name: symbol.name().map(|s| s.as_bytes().to_vec()),
-                    filename: symbol.filename().map(|p| p.to_path_buf()),
-                    lineno: symbol.lineno(),
-                    colno: symbol.colno(),
-                };
-
-                f.symbols.push(symbol);
-            });
-            bt.frames.push(f);
-        }
-
-        println!("{bt:?}");
-
-        break;
-    }
-}
-
-fn fulfill_backtrace(channel: &BtChan) {
-    let mut frames = arrayvec::ArrayVec::new();
-    unsafe {
-        backtrace::trace_unsynchronized(|f| frames.try_push(f.clone()).map_or(false, |_| true))
-    }
-    channel.send(frames);
-}
-
+/// Configures observation of one multi-thread Tokio runtime.
+///
+/// ```
+/// use std::time::Duration;
+/// use tokio_supervisor::Supervisor;
+///
+/// let runtime = tokio::runtime::Builder::new_multi_thread().worker_threads(2).build()?;
+/// let (monitor, events) = Supervisor::new(runtime.handle().clone())
+///     .spawn(Duration::from_millis(100))?;
+/// // An independent reporter can receive events without using the runtime.
+/// monitor.shutdown().expect("watchdog panicked");
+/// assert!(events.recv().is_err());
+/// # Ok::<(), std::io::Error>(())
+/// ```
 pub struct Supervisor {
-    workers: Vec<WorkerState>,
-    handle: tokio::runtime::Handle,
     metrics: RuntimeMetrics,
-}
-
-static THREADS: ThreadMapping = ThreadMapping {
-    threads: RwLock::new(None),
-};
-
-struct ThreadMapping {
-    threads: RwLock<Option<HashMap<ThreadId, libc::pthread_t>>>,
-}
-
-impl ThreadMapping {
-    fn get_pthread(&self, t: &ThreadId) -> Option<libc::pthread_t> {
-        self.threads
-            .read()
-            .unwrap()
-            .as_ref()
-            .and_then(|h| h.get(t).copied())
-    }
-}
-
-pub fn on_thread_start() {
-    let pthread = unsafe { libc::pthread_self() };
-    let thread = std::thread::current().id();
-
-    THREADS
-        .threads
-        .write()
-        .unwrap()
-        .get_or_insert_with(HashMap::default)
-        .entry(thread)
-        .and_modify(|p| *p = pthread)
-        .or_insert(pthread);
-}
-
-pub fn on_thread_stop() {
-    let thread = std::thread::current().id();
-
-    THREADS
-        .threads
-        .write()
-        .unwrap()
-        .as_mut()
-        .map(|h| h.remove(&thread));
+    flavor: RuntimeFlavor,
 }
 
 impl Supervisor {
-    pub fn new(handle: tokio::runtime::Handle) -> Self {
-        let metrics = handle.metrics();
-        let workers: Vec<WorkerState> = std::iter::repeat(WorkerState {
-            poll_count: 0,
-            blocked: true,
-        })
-        .take(metrics.num_workers())
-        .collect();
-
-        Supervisor {
-            workers,
-            handle,
-            metrics,
+    pub fn new(handle: Handle) -> Self {
+        Self {
+            metrics: handle.metrics(),
+            flavor: handle.runtime_flavor(),
         }
     }
 
-    async fn sample(&mut self, channel: &'static BtChan) {
-        for (i, worker_state) in self.workers.iter_mut().enumerate() {
-            let new_count = self.metrics.worker_poll_count(i);
+    /// Start an independent watchdog and return its lifecycle guard and events.
+    ///
+    /// `interval` is both the sampling period and the minimum observed
+    /// no-progress time before reporting a stall. Detection can take an additional
+    /// interval depending on sampling alignment, plus OS scheduling delays.
+    /// Only transitions are reported, rather than repeating a stall every tick.
+    ///
+    /// The event queue holds two events per runtime worker. If it fills, new
+    /// events are dropped and counted by [`Monitor::dropped_events`]; sampling
+    /// never waits for a consumer. Recovery does not promise that the corresponding
+    /// stall event was delivered. Receiver disconnection is noticed on the next
+    /// event publication. Use the monitor to stop promptly even when workers are idle.
+    ///
+    /// Keep the monitor alive while observing the runtime. Receive events on a
+    /// separate reporting thread using [`Receiver::recv`]. Do not block a runtime
+    /// worker waiting on this synchronous receiver. Event delivery does not invoke
+    /// application wakers or reporting callbacks on the watchdog thread.
+    ///
+    /// Returns an error for zero intervals, unsupported runtime flavors, or an
+    /// OS thread creation failure. The supported flavor is `MultiThread`.
+    pub fn spawn(self, interval: Duration) -> io::Result<(Monitor, Receiver<Event>)> {
+        if interval.is_zero() {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "sampling interval must be nonzero",
+            ));
+        }
+        if !matches!(self.flavor, RuntimeFlavor::MultiThread) {
+            return Err(io::Error::new(
+                io::ErrorKind::InvalidInput,
+                "supervision requires a multi-thread runtime",
+            ));
+        }
 
-            // An odd count means that the worker is currently parked. An even count means that the worker is currently active.
-            let unpark_count = self.metrics.worker_park_unpark_count(i);
+        let (events, receiver) = mpsc::sync_channel(self.metrics.num_workers() * 2);
+        let (shutdown, stopped) = mpsc::channel();
+        let dropped = Arc::new(AtomicUsize::new(0));
+        let lost = dropped.clone();
+        let thread = thread::Builder::new()
+            .name("tokio-supervisor".into())
+            .spawn(move || {
+                let now = Instant::now();
+                let mut workers: Vec<_> = (0..self.metrics.num_workers())
+                    .map(|i| Worker::new(Observation::read(&self.metrics, i), now))
+                    .collect();
 
-            if unpark_count % 2 == 1 {
-                // we are parked. mark as unblocked.
-                worker_state.blocked = false;
-            } else if worker_state.poll_count == new_count {
-                // no poll progress was made since last loop.
-                if !worker_state.blocked {
-                    // we were not blocked before. get the backtrace from the registered thread.
-                    println!("worker thread {i} is blocked");
-                    if let Some(thread) = self
-                        .metrics
-                        .worker_thread_id(i)
-                        .and_then(|t| THREADS.get_pthread(&t))
-                    {
-                        tokio::task::spawn_blocking(move || request_backtrace(thread, channel))
-                            .await
-                            .unwrap();
+                while matches!(
+                    stopped.recv_timeout(interval),
+                    Err(mpsc::RecvTimeoutError::Timeout)
+                ) {
+                    let now = Instant::now();
+                    for (i, worker) in workers.iter_mut().enumerate() {
+                        let observation = Observation::read(&self.metrics, i);
+                        if let Some(event) = worker.observe(i, observation, now, interval) {
+                            match events.try_send(event) {
+                                Ok(()) => {}
+                                Err(TrySendError::Full(_)) => {
+                                    lost.fetch_add(1, Ordering::Relaxed);
+                                }
+                                Err(TrySendError::Disconnected(_)) => return,
+                            }
+                        }
                     }
                 }
-                worker_state.blocked = true;
-            } else {
-                // progress was made since last loop. mark as unblocked.
-                worker_state.blocked = false;
-            }
+            })?;
+        Ok((
+            Monitor {
+                shutdown: Some(shutdown),
+                thread: Some(thread),
+                dropped,
+            },
+            receiver,
+        ))
+    }
+}
 
-            worker_state.poll_count = new_count;
-        }
+/// Owns the watchdog thread. Drop stops and joins it independently of Tokio.
+///
+/// Shutdown does not wait for application tasks, event consumption, or callbacks.
+/// OS scheduling and the currently executing metrics sample can still delay it.
+#[must_use = "dropping the monitor stops supervision"]
+pub struct Monitor {
+    shutdown: Option<mpsc::Sender<()>>,
+    thread: Option<JoinHandle<()>>,
+    dropped: Arc<AtomicUsize>,
+}
+
+impl Monitor {
+    /// Number of events dropped because the bounded event queue was full.
+    pub fn dropped_events(&self) -> usize {
+        self.dropped.load(Ordering::Relaxed)
     }
 
-    async fn run(&mut self, interval: Duration, channel: &'static BtChan) {
-        let mut interval = tokio::time::interval(interval);
-        loop {
-            interval.tick().await;
-            self.sample(channel).await;
-        }
+    /// Stop and join the watchdog, returning any watchdog thread panic.
+    pub fn shutdown(mut self) -> thread::Result<()> {
+        self.stop()
     }
 
-    pub fn spawn(mut self, interval: Duration) {
-        let channel = register_backtrace();
-        let rt = self.handle.clone();
-        rt.spawn(async move {
-            self.run(interval, channel).await;
-        });
+    fn stop(&mut self) -> thread::Result<()> {
+        // Disconnecting wakes recv_timeout even when the interval is very long.
+        self.shutdown.take();
+        match self.thread.take() {
+            Some(thread) => thread.join(),
+            None => Ok(()),
+        }
+    }
+}
+
+impl Drop for Monitor {
+    fn drop(&mut self) {
+        let _ = self.stop();
     }
 }
 
 #[derive(Clone, Copy)]
-struct WorkerState {
+struct Observation {
     poll_count: u64,
-    blocked: bool,
+    parked: bool,
+    thread_id: Option<ThreadId>,
 }
 
-#[cfg(test)]
-mod tests {
-    use std::{sync::mpsc, time::Duration};
-
-    use crate::{Supervisor, THREADS};
-
-    #[test]
-    fn runtime_workers_register_and_unregister() {
-        let (started, workers) = mpsc::channel();
-        let rt = tokio::runtime::Builder::new_multi_thread()
-            .worker_threads(2)
-            .enable_all()
-            .on_thread_start(move || {
-                crate::on_thread_start();
-                started.send(std::thread::current().id()).unwrap();
-            })
-            .on_thread_stop(crate::on_thread_stop)
-            .build()
-            .unwrap();
-
-        let workers: Vec<_> = (0..2)
-            .map(|_| workers.recv_timeout(Duration::from_secs(5)).unwrap())
-            .collect();
-        for worker in &workers {
-            assert!(THREADS.get_pthread(worker).is_some());
-        }
-        let supervisor = Supervisor::new(rt.handle().clone());
-        assert_eq!(supervisor.workers.len(), 2);
-        drop(supervisor);
-        drop(rt);
-
-        for worker in &workers {
-            assert!(THREADS.get_pthread(worker).is_none());
+impl Observation {
+    fn read(metrics: &RuntimeMetrics, worker: usize) -> Self {
+        Self {
+            poll_count: metrics.worker_poll_count(worker),
+            parked: metrics.worker_park_unpark_count(worker) % 2 == 1,
+            thread_id: metrics.worker_thread_id(worker),
         }
     }
 }
+
+struct Worker {
+    previous: Observation,
+    progress: Instant,
+    stalled: bool,
+}
+
+impl Worker {
+    fn new(previous: Observation, now: Instant) -> Self {
+        Self {
+            previous,
+            progress: now,
+            stalled: false,
+        }
+    }
+
+    fn observe(
+        &mut self,
+        worker: usize,
+        current: Observation,
+        now: Instant,
+        interval: Duration,
+    ) -> Option<Event> {
+        let duration = now.saturating_duration_since(self.progress);
+        let progress = current.parked
+            || self.previous.parked
+            || current.thread_id.is_none()
+            || current.thread_id != self.previous.thread_id
+            || current.poll_count != self.previous.poll_count;
+        let event = if progress {
+            let event = if self.stalled {
+                self.previous.thread_id.map(|thread_id| Event::Recovered {
+                    worker,
+                    thread_id,
+                    duration,
+                })
+            } else {
+                None
+            };
+            self.progress = now;
+            self.stalled = false;
+            event
+        } else if !self.stalled && duration >= interval {
+            current.thread_id.map(|thread_id| {
+                self.stalled = true;
+                Event::Stalled {
+                    worker,
+                    thread_id,
+                    duration,
+                }
+            })
+        } else {
+            None
+        };
+        self.previous = current;
+        event
+    }
+}
+
+#[cfg(test)]
+mod tests;

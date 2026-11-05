@@ -4,12 +4,7 @@ version = "0.1.0"
 edition = "2021"
 
 [dependencies]
-arrayvec = "0.7.6"
-backtrace = "0.3.73"
-libc = "0.2.0"
-signal-hook = "0.3.17"
-tokio = { version = "1.40", features = ["rt", "rt-multi-thread", "sync", "time"] }
-foldhash = "0.1"
+tokio = { version = "1.40", features = ["rt", "rt-multi-thread"] }
 
 [dev-dependencies]
 axum = "0.7.5"
